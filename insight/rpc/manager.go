@@ -1,7 +1,11 @@
 package rpc
 
 import (
+	"encoding/json"
+	"io/ioutil"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/prometheus/prometheus/storage"
@@ -17,15 +21,17 @@ type Appendable interface {
 
 type Manager struct {
 	sync.Mutex
-	stopped    bool
-	workerPool *WorkerPool
-	rpcServer  *rpc.MetricsRpcServer
-	rpcSender  *rpc.SendManager
+	stopped           bool
+	workerPool        *WorkerPool
+	rpcServer         *rpc.MetricsRpcServer
+	rpcSender         *rpc.SendManager
+	whiteList         map[string]bool
+	whiteListSwitcher bool
 }
 
 //addr:local rpc server addr, for listen
 //remoteAddr: remote rpc server addr, for send
-func NewManager(addr, remoteAddr, datasource string, appender Appendable) (*Manager, error) {
+func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteListFile string, whiteListSwitcher bool) (*Manager, error) {
 	rpcServer := rpc.NewMetricsRpcServer(addr)
 	var rpcClient *rpc.SendManager
 	if len(remoteAddr) > 8 {
@@ -41,11 +47,31 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable) (*Mana
 	}
 	pool := NewWorkerPool(c, appender)
 
+	//获取preset metrics list
+	mMap := make(map[string]bool)
+	if whiteListSwitcher {
+		var mList []string
+		if _, err := os.Stat(whiteListFile); err != nil {
+			log.Infof("whiteListFile doesn't exist, err: %s", err.Error())
+		}
+		b, err := ioutil.ReadFile(file)
+		if err != nil {
+			log.Infof("load whiteListFile err: %s", err.Error())
+		}
+		if err := json.Unmarshal(b, &mList); err != nil {
+			log.Infof("Unmarshal whiteListFile err: %s", err.Error())
+		}
+		for _, m := range mList {
+			mMap[m] = true
+		}
+	}
 	m := &Manager{
-		stopped:    true,
-		rpcServer:  rpcServer,
-		rpcSender:  rpcClient,
-		workerPool: pool,
+		stopped:           true,
+		rpcServer:         rpcServer,
+		rpcSender:         rpcClient,
+		workerPool:        pool,
+		whiteListSwitcher: whiteListSwitcher,
+		whiteList:         mMap,
 	}
 	pool.manager = m
 	return m, nil
@@ -97,9 +123,36 @@ func (m *Manager) Stop() {
 
 func (m *Manager) WriteToRemote(ms *metrics.Metrics) {
 	if m.rpcSender != nil {
-		if err := m.rpcSender.Send(ms); err != nil {
+		mList := ms
+		if m.whiteListSwitcher {
+			mList = m.getFilteredMetrics(ms)
+		}
+		if err := m.rpcSender.Send(mList); err != nil {
 			log.Errorf("write to remote error:%s", err.Error())
 		}
+	}
+}
+
+func (m *Manager) getFilteredMetrics(ms *metrics.Metrics) *metrics.Metrics {
+	newMs := &metrics.Metrics{List: make([]*metrics.Metric, 0)}
+	for _, metric := range ms.List {
+		if m.checkIsInWhiteList(metric) {
+			newMs.List = append(newMs.List, metric)
+		}
+	}
+	return newMs
+}
+
+func (m *Manager) checkIsInWhiteList(metric *metrics.Metric) bool {
+	mKey := metric.MetricKey
+	index := strings.Index(mKey, "{")
+	if index >= 0 {
+		mKey = mKey[:index]
+	}
+	if _, in := m.whiteList[mKey]; in {
+		return true
+	} else {
+		return false
 	}
 }
 
