@@ -78,10 +78,13 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 			goto QUIT
 		}
 
-		for _, m := range conf.MetricList {
-			m = strings.Trim(m, " ")
-			mMap[m] = true
+		log.Infof("MetricList : %v", conf.MetricList)
+		for _, metric := range conf.MetricList {
+			metric = strings.Trim(metric, " ")
+			log.Infof("Metric : %v", metric)
+			mMap[metric] = true
 		}
+		log.Infof("mMap : %v", mMap)
 	}
 
 QUIT:
