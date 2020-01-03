@@ -66,7 +66,7 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 			goto QUIT
 		}
 
-		b, err = ioutil.ReadFile(whiteListFile)
+		b, err := ioutil.ReadFile(whiteListFile)
 		if err != nil {
 			log.Infof("load whiteListFile err: %s", err.Error())
 			goto QUIT
