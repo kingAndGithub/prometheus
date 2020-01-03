@@ -54,7 +54,7 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 		if _, err := os.Stat(whiteListFile); err != nil {
 			log.Infof("whiteListFile doesn't exist, err: %s", err.Error())
 		}
-		b, err := ioutil.ReadFile(file)
+		b, err := ioutil.ReadFile(whiteListFile)
 		if err != nil {
 			log.Infof("load whiteListFile err: %s", err.Error())
 		}
