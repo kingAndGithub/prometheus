@@ -58,7 +58,7 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 	mMap := make(map[string]bool)
 	if whiteListSwitcher {
 		type Yaml struct {
-			MetricList []string `yaml:"rule_files,omitempty"`
+			MetricList []string `yaml:"metric_list,omitempty"`
 		}
 
 		if _, err = os.Stat(whiteListFile); err != nil {
