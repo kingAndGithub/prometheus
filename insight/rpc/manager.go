@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"encoding/json"
 	"io/ioutil"
 	"os"
 	"runtime"
@@ -9,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/prometheus/prometheus/storage"
+	yaml "gopkg.in/yaml.v2"
 
 	"auto-monitor/common/log"
 	"auto-monitor/common/rpc"
@@ -73,7 +73,7 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 		}
 
 		conf := new(Yaml)
-		if err = json.Unmarshal(b, conf); err != nil {
+		if err = yaml.Unmarshal(b, conf); err != nil {
 			log.Infof("Unmarshal whiteListFile err: %s", err.Error())
 			goto QUIT
 		}
