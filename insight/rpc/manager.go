@@ -47,34 +47,48 @@ func NewManager(addr, remoteAddr, datasource string, appender Appendable, whiteL
 	}
 	pool := NewWorkerPool(c, appender)
 
+	m := &Manager{
+		stopped:    true,
+		rpcServer:  rpcServer,
+		rpcSender:  rpcClient,
+		workerPool: pool,
+	}
 	//获取preset metrics list
+	var err error
 	mMap := make(map[string]bool)
 	if whiteListSwitcher {
-		var mList []string
-		if _, err := os.Stat(whiteListFile); err != nil {
-			log.Infof("whiteListFile doesn't exist, err: %s", err.Error())
+		type Yaml struct {
+			MetricList []string `yaml:"rule_files,omitempty"`
 		}
-		b, err := ioutil.ReadFile(whiteListFile)
+
+		if _, err = os.Stat(whiteListFile); err != nil {
+			log.Infof("whiteListFile doesn't exist, err: %s", err.Error())
+			goto QUIT
+		}
+
+		b, err = ioutil.ReadFile(whiteListFile)
 		if err != nil {
 			log.Infof("load whiteListFile err: %s", err.Error())
+			goto QUIT
 		}
-		if err := json.Unmarshal(b, &mList); err != nil {
+
+		conf := new(Yaml)
+		if err = json.Unmarshal(b, conf); err != nil {
 			log.Infof("Unmarshal whiteListFile err: %s", err.Error())
+			goto QUIT
 		}
-		for _, m := range mList {
+
+		for _, m := range conf.MetricList {
+			m = strings.Trim(m, " ")
 			mMap[m] = true
 		}
 	}
-	m := &Manager{
-		stopped:           true,
-		rpcServer:         rpcServer,
-		rpcSender:         rpcClient,
-		workerPool:        pool,
-		whiteListSwitcher: whiteListSwitcher,
-		whiteList:         mMap,
-	}
+
+QUIT:
+	m.whiteListSwitcher = whiteListSwitcher
+	m.whiteList = mMap
 	pool.manager = m
-	return m, nil
+	return m, err
 }
 
 func (m *Manager) Start() error {
