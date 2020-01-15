@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"bufio"
+	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -65,8 +67,23 @@ func (filter *MetricFilter) reloadMetricFilterFile() {
 	filter.Unlock()
 }
 
+// reload the filtered metrics
 func (filter *MetricFilter) ReloadMetricFilter() {
 	filter.reloadMetricFilterFile()
+}
+
+// to show the loaded filtered metrics
+func (filter *MetricFilter) MetricFilter() string {
+	filter.RLock()
+	whiteList := filter.whiteList
+	filter.RUnlock()
+
+	var byteBuffer bytes.Buffer
+	for key := range whiteList {
+		byteBuffer.WriteString(fmt.Sprintf("%s\n", key))
+	}
+	log.Infof("show filter map: %v", whiteList)
+	return byteBuffer.String()
 }
 
 func (filter *MetricFilter) Filter(ms *metrics.Metrics) *metrics.Metrics {

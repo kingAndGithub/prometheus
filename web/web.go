@@ -375,13 +375,23 @@ func New(logger log.Logger, o *Options) *Handler {
 		fmt.Fprintf(w, "Prometheus is Ready.\n")
 	}))
 
-	// reload metric filter
+	// show the loaded filtered metrics
 	router.Get("/metric-filter/reload", readyf(func(w http.ResponseWriter, r *http.Request) {
 		if insight.MetricFilter != nil {
 			insight.MetricFilter.ReloadMetricFilter()
 		}
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Prometheus Metric Filter is Ok.\n")
+	}))
+
+	// reload metric filter
+	router.Get("/metric-filter", readyf(func(w http.ResponseWriter, r *http.Request) {
+		var metrics string
+		if insight.MetricFilter != nil {
+			metrics = insight.MetricFilter.MetricFilter()
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "%s", metrics)
 	}))
 
 	return h
