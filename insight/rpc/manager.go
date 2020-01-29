@@ -15,6 +15,8 @@ type Appendable interface {
 	Appender() (storage.Appender, error)
 }
 
+var LogParsed bool
+
 type Manager struct {
 	sync.Mutex
 	stopped      bool

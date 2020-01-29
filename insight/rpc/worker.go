@@ -232,6 +232,10 @@ func (w *Worker) storage(ms []*metrics.Metric, app storage.Appender) (int, error
 			} else {
 				w.seriesCache.add(m.MetricKey, ref, lset, tSec)
 			}
+
+			if LogParsed {
+				log.Infof("worker: %d add:%d, metric: %s", w.index, added, m.MetricKey)
+			}
 		}
 	}
 
