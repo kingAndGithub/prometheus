@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash"
+	perrs "github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/storage"
@@ -90,25 +91,8 @@ func (w *Worker) run() {
 
 	count := 0
 	const commitCount = 2048
-	errCount := 0
-	var err error
-	var app storage.Appender
-	for {
-		app, err = w.appender.Appender()
-		if err != nil {
-			log.Errorf("w.appender.Appender error:%s", err.Error())
 
-			errCount++
-			if errCount >= 5 {
-				panic(err)
-			}
-			time.Sleep(2 * time.Second)
-			continue
-		} else {
-			break
-		}
-	}
-
+	app := w.appender.Appender()
 	commit := func() {
 		//防止同一时间提交
 		if log.IsDebug() {
@@ -123,11 +107,7 @@ func (w *Worker) run() {
 		}
 
 		count = 0
-		app, err = w.appender.Appender()
-		if err != nil {
-			log.Errorf("w.appender.Appender error:%s", err.Error())
-			panic(err)
-		}
+		app = w.appender.Appender()
 	}
 
 	log.Infof("worker %d run...", w.index)
@@ -188,8 +168,9 @@ func (w *Worker) storage(ms []*metrics.Metric, app storage.Appender) (int, error
 		}
 
 		if ok {
-			if err := app.AddFast(ce.lset, ce.ref, m.Time, m.Value); err != nil {
-				if err == storage.ErrNotFound {
+			//if err := app.AddFast(ce.lset, ce.ref, m.Time, m.Value); err != nil {
+			if err := app.AddFast(ce.ref, m.Time, m.Value); err != nil {
+				if perrs.Is(err, storage.ErrNotFound) {
 					ok = false
 				} else {
 					//log.Errorf("appender.AddFast error:%s", err.Error())

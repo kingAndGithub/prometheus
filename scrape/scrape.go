@@ -23,7 +23,9 @@ import (
 	"io/ioutil"
 	"math"
 	"net/http"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -49,6 +51,12 @@ import (
 	"auto-monitor/common/rpc/gen-go/metrics"
 	"github.com/prometheus/prometheus/insight"
 )
+
+const (
+	kubePodLabels = "kube_pod_labels"
+)
+
+var errNameLabelMandatory = fmt.Errorf("missing metric name (%s label)", labels.MetricName)
 
 var (
 	targetIntervalLength = prometheus.NewSummaryVec(
@@ -139,24 +147,27 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(targetIntervalLength)
-	prometheus.MustRegister(targetReloadIntervalLength)
-	prometheus.MustRegister(targetScrapePools)
-	prometheus.MustRegister(targetScrapePoolsFailed)
-	prometheus.MustRegister(targetScrapePoolReloads)
-	prometheus.MustRegister(targetScrapePoolReloadsFailed)
-	prometheus.MustRegister(targetSyncIntervalLength)
-	prometheus.MustRegister(targetScrapePoolSyncsCounter)
-	prometheus.MustRegister(targetScrapeSampleLimit)
-	prometheus.MustRegister(targetScrapeSampleDuplicate)
-	prometheus.MustRegister(targetScrapeSampleOutOfOrder)
-	prometheus.MustRegister(targetScrapeSampleOutOfBounds)
-	prometheus.MustRegister(targetScrapeCacheFlushForced)
+	prometheus.MustRegister(
+		targetIntervalLength,
+		targetReloadIntervalLength,
+		targetScrapePools,
+		targetScrapePoolsFailed,
+		targetScrapePoolReloads,
+		targetScrapePoolReloadsFailed,
+		targetSyncIntervalLength,
+		targetScrapePoolSyncsCounter,
+		targetScrapeSampleLimit,
+		targetScrapeSampleDuplicate,
+		targetScrapeSampleOutOfOrder,
+		targetScrapeSampleOutOfBounds,
+		targetScrapeCacheFlushForced,
+		targetMetadataCache,
+	)
 }
 
 // scrapePool manages scrapes for sets of targets.
 type scrapePool struct {
-	appendable Appendable
+	appendable storage.Appendable
 	logger     log.Logger
 
 	mtx    sync.RWMutex
@@ -180,13 +191,14 @@ type scrapeLoopOptions struct {
 	honorLabels     bool
 	honorTimestamps bool
 	mrc             []*relabel.Config
+	cache           *scrapeCache
 }
 
 const maxAheadTime = 10 * time.Minute
 
 type labelsMutator func(labels.Labels) labels.Labels
 
-func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, logger log.Logger) (*scrapePool, error) {
+func newScrapePool(cfg *config.ScrapeConfig, app storage.Appendable, jitterSeed uint64, logger log.Logger) (*scrapePool, error) {
 	targetScrapePools.Inc()
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -212,8 +224,11 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 	}
 	sp.newLoop = func(opts scrapeLoopOptions) loop {
 		// Update the targets retrieval function for metadata to a new scrape cache.
-		cache := newScrapeCache()
-		opts.target.setMetadataStore(cache)
+		cache := opts.cache
+		if cache == nil {
+			cache = newScrapeCache()
+		}
+		opts.target.SetMetadataStore(cache)
 
 		return newScrapeLoop(
 			ctx,
@@ -224,13 +239,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 				return mutateSampleLabels(l, opts.target, opts.honorLabels, opts.mrc)
 			},
 			func(l labels.Labels) labels.Labels { return mutateReportSampleLabels(l, opts.target) },
-			func() storage.Appender {
-				app, err := app.Appender()
-				if err != nil {
-					panic(err)
-				}
-				return appender(app, opts.limit)
-			},
+			func() storage.Appender { return appender(app.Appender(), opts.limit) },
 			cache,
 			jitterSeed,
 			opts.honorTimestamps,
@@ -295,6 +304,8 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 		targetScrapePoolReloadsFailed.Inc()
 		return errors.Wrap(err, "error creating HTTP client")
 	}
+
+	reuseCache := reusableCache(sp.config, cfg)
 	sp.config = cfg
 	oldClient := sp.client
 	sp.client = client
@@ -310,6 +321,13 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 	)
 
 	for fp, oldLoop := range sp.loops {
+		var cache *scrapeCache
+		if oc := oldLoop.getCache(); reuseCache && oc != nil {
+			oldLoop.disableEndOfRunStalenessMarkers()
+			cache = oc
+		} else {
+			cache = newScrapeCache()
+		}
 		var (
 			t       = sp.activeTargets[fp]
 			s       = &targetScraper{Target: t, client: sp.client, timeout: timeout}
@@ -320,6 +338,7 @@ func (sp *scrapePool) reload(cfg *config.ScrapeConfig) error {
 				honorLabels:     honorLabels,
 				honorTimestamps: honorTimestamps,
 				mrc:             mrc,
+				cache:           cache,
 			})
 		)
 		wg.Add(1)
@@ -455,9 +474,9 @@ func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*re
 		for _, l := range target.Labels() {
 			// existingValue will be empty if l.Name doesn't exist.
 			existingValue := lset.Get(l.Name)
-			// Because setting a label with an empty value is a no-op,
-			// this will only create the prefixed label if necessary.
-			lb.Set(model.ExportedLabelPrefix+l.Name, existingValue)
+			if existingValue != "" {
+				lb.Set(model.ExportedLabelPrefix+l.Name, existingValue)
+			}
 			// It is now safe to set the target label.
 			lb.Set(l.Name, l.Value)
 		}
@@ -503,7 +522,7 @@ func appender(app storage.Appender, limit int) storage.Appender {
 // A scraper retrieves samples and accepts a status report at the end.
 type scraper interface {
 	scrape(ctx context.Context, w io.Writer) (string, error)
-	report(start time.Time, dur time.Duration, err error)
+	Report(start time.Time, dur time.Duration, err error)
 	offset(interval time.Duration, jitterSeed uint64) time.Duration
 }
 
@@ -583,6 +602,8 @@ func (s *targetScraper) scrape(ctx context.Context, w io.Writer) (string, error)
 type loop interface {
 	run(interval, timeout time.Duration, errc chan<- error)
 	stop()
+	getCache() *scrapeCache
+	disableEndOfRunStalenessMarkers()
 }
 
 type cacheEntry struct {
@@ -611,7 +632,11 @@ type scrapeLoop struct {
 	cancel    func()
 	stopped   chan struct{}
 
-	lastScrapeCount int
+	disabledEndOfRunStalenessMarkers bool
+	lastScrapeCount                  int
+
+	//-1:不含有kubePodLabels  1：含有
+	kubePodLabelsStatus int
 }
 
 // scrapeCache tracks mappings of exposed metric strings to label sets and
@@ -648,6 +673,11 @@ type metaEntry struct {
 	typ      textparse.MetricType
 	help     string
 	unit     string
+}
+
+func (m *metaEntry) size() int {
+	// The attribute lastIter although part of the struct it is not metadata.
+	return len(m.help) + len(m.unit) + len(m.typ)
 }
 
 func newScrapeCache() *scrapeCache {
@@ -726,7 +756,6 @@ func (c *scrapeCache) addRef(met string, ref uint64, lset labels.Labels, hash ui
 		return nil
 	}
 	ce := &cacheEntry{ref: ref, lastIter: c.iter, lset: lset, hash: hash}
-	ce.key = labelsKey(lset)
 	c.series[met] = ce
 	return ce
 }
@@ -804,7 +833,7 @@ func (c *scrapeCache) setUnit(metric, unit []byte) {
 	c.metaMtx.Unlock()
 }
 
-func (c *scrapeCache) getMetadata(metric string) (MetricMetadata, bool) {
+func (c *scrapeCache) GetMetadata(metric string) (MetricMetadata, bool) {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -820,7 +849,7 @@ func (c *scrapeCache) getMetadata(metric string) (MetricMetadata, bool) {
 	}, true
 }
 
-func (c *scrapeCache) listMetadata() []MetricMetadata {
+func (c *scrapeCache) ListMetadata() []MetricMetadata {
 	c.metaMtx.Lock()
 	defer c.metaMtx.Unlock()
 
@@ -835,6 +864,25 @@ func (c *scrapeCache) listMetadata() []MetricMetadata {
 		})
 	}
 	return res
+}
+
+// MetadataSize returns the size of the metadata cache.
+func (c *scrapeCache) SizeMetadata() (s int) {
+	c.metaMtx.Lock()
+	defer c.metaMtx.Unlock()
+	for _, e := range c.metadata {
+		s += e.size()
+	}
+
+	return s
+}
+
+// MetadataLen returns the number of metadata entries in the cache.
+func (c *scrapeCache) LengthMetadata() int {
+	c.metaMtx.Lock()
+	defer c.metaMtx.Unlock()
+
+	return len(c.metadata)
 }
 
 func newScrapeLoop(ctx context.Context,
@@ -937,7 +985,7 @@ mainLoop:
 		// we still call sl.append to trigger stale markers.
 		total, added, seriesAdded, appErr := sl.append(b, contentType, start)
 		if appErr != nil {
-			level.Warn(sl.l).Log("msg", "append failed", "err", appErr)
+			level.Debug(sl.l).Log("msg", "append failed", "err", appErr)
 			// The append failed, probably due to a parse error or sample limit.
 			// Call sl.append again with an empty scrape to trigger stale markers.
 			if _, _, _, err := sl.append([]byte{}, "", start); err != nil {
@@ -968,7 +1016,9 @@ mainLoop:
 
 	close(sl.stopped)
 
-	sl.endOfRunStaleness(last, ticker, interval)
+	if !sl.disabledEndOfRunStalenessMarkers {
+		sl.endOfRunStaleness(last, ticker, interval)
+	}
 }
 
 func (sl *scrapeLoop) endOfRunStaleness(last time.Time, ticker *time.Ticker, interval time.Duration) {
@@ -1026,24 +1076,72 @@ func (sl *scrapeLoop) stop() {
 	<-sl.stopped
 }
 
+func (sl *scrapeLoop) disableEndOfRunStalenessMarkers() {
+	sl.disabledEndOfRunStalenessMarkers = true
+}
+
+func (sl *scrapeLoop) getCache() *scrapeCache {
+	return sl.cache
+}
+
+type appendErrors struct {
+	numOutOfOrder  int
+	numDuplicates  int
+	numOutOfBounds int
+}
+
 func (sl *scrapeLoop) append(b []byte, contentType string, ts time.Time) (total, added, seriesAdded int, err error) {
 	var (
 		app            = sl.appender()
 		p              = textparse.New(b, contentType)
 		defTime        = timestamp.FromTime(ts)
-		numOutOfOrder  = 0
-		numDuplicates  = 0
-		numOutOfBounds = 0
+		appErrs        = appendErrors{}
+		sampleLimitErr error
 	)
-	var sampleLimitErr error
+
+	lostIndexCount := 0
+	defer func() {
+		if err != nil {
+			app.Rollback()
+			return
+		}
+		if err = app.Commit(); err != nil {
+			return
+		}
+		// Only perform cache cleaning if the scrape was not empty.
+		// An empty scrape (usually) is used to indicate a failed scrape.
+		sl.cache.iterDone(len(b) > 0)
+
+		if lostIndexCount > 0 {
+			level.Warn(sl.l).Log("msg", "Warn on relabels ", "Lost Index Metrics Count", lostIndexCount)
+		}
+	}()
 
 	//for send to remote
+	//白名单
+	var whiteList map[string]bool
+	if insight.MetricFilter != nil {
+		whiteList = insight.MetricFilter.FilterMap()
+	}
+	//appEnv映射map
+	writeRelabelMap := make(map[string]*insight.AppEnv)
+	readRelabelMap := insight.RelabelMap.GetMap()
+
 	count := sl.lastScrapeCount
 	if count == 0 {
 		count = 256
 	}
-	ms := make([]*metrics.Metric, 0, count)
-	addFun := func(key string, t int64, v float64) {
+	ms := make([]*metrics.Metric, 0, count+16)
+	addFun := func(ce *cacheEntry, t int64, v float64) {
+		key := ce.key
+		if len(key) == 0 {
+			lostIndex := false
+			if key, lostIndex = labelsKey(ce.lset, readRelabelMap); lostIndex {
+				lostIndexCount += 1
+			} else {
+				ce.key = key
+			}
+		}
 		m := &metrics.Metric{
 			Time:      t,
 			Value:     v,
@@ -1054,7 +1152,10 @@ func (sl *scrapeLoop) append(b []byte, contentType string, ts time.Time) (total,
 
 loop:
 	for {
-		var et textparse.Entry
+		var (
+			et          textparse.Entry
+			sampleAdded bool
+		)
 		if et, err = p.Next(); err != nil {
 			if err == io.EOF {
 				err = nil
@@ -1090,37 +1191,13 @@ loop:
 			continue
 		}
 		ce, ok := sl.cache.get(yoloString(met))
+
 		if ok {
-			switch err = app.AddFast(ce.lset, ce.ref, t, v); err {
-			case nil:
-				if tp == nil {
-					sl.cache.trackStaleness(ce.hash, ce.lset)
-				}
-			case storage.ErrNotFound:
+			err = app.AddFast(ce.ref, t, v)
+			sampleAdded, err = sl.checkAddError(ce, met, tp, err, &sampleLimitErr, appErrs)
+			// In theory this should never happen.
+			if err == storage.ErrNotFound {
 				ok = false
-			case storage.ErrOutOfOrderSample:
-				numOutOfOrder++
-				level.Debug(sl.l).Log("msg", "Out of order sample", "series", string(met))
-				targetScrapeSampleOutOfOrder.Inc()
-				continue
-			case storage.ErrDuplicateSampleForTimestamp:
-				numDuplicates++
-				level.Debug(sl.l).Log("msg", "Duplicate sample for timestamp", "series", string(met))
-				targetScrapeSampleDuplicate.Inc()
-				continue
-			case storage.ErrOutOfBounds:
-				numOutOfBounds++
-				level.Debug(sl.l).Log("msg", "Out of bounds metric", "series", string(met))
-				targetScrapeSampleOutOfBounds.Inc()
-				continue
-			case errSampleLimit:
-				// Keep on parsing output if we hit the limit, so we report the correct
-				// total number of samples scraped.
-				sampleLimitErr = err
-				added++
-				continue
-			default:
-				break loop
 			}
 		}
 		if !ok {
@@ -1139,47 +1216,63 @@ loop:
 				continue
 			}
 
-			var ref uint64
-			ref, err = app.Add(lset, t, v)
-			switch err {
-			case nil:
-			case storage.ErrOutOfOrderSample:
-				err = nil
-				numOutOfOrder++
-				level.Debug(sl.l).Log("msg", "Out of order sample", "series", string(met))
-				targetScrapeSampleOutOfOrder.Inc()
-				continue
-			case storage.ErrDuplicateSampleForTimestamp:
-				err = nil
-				numDuplicates++
-				level.Debug(sl.l).Log("msg", "Duplicate sample for timestamp", "series", string(met))
-				targetScrapeSampleDuplicate.Inc()
-				continue
-			case storage.ErrOutOfBounds:
-				err = nil
-				numOutOfBounds++
-				level.Debug(sl.l).Log("msg", "Out of bounds metric", "series", string(met))
-				targetScrapeSampleOutOfBounds.Inc()
-				continue
-			case errSampleLimit:
-				sampleLimitErr = err
-				added++
-				continue
-			default:
-				level.Debug(sl.l).Log("msg", "unexpected error", "series", string(met), "err", err)
+			if !lset.Has(labels.MetricName) {
+				err = errNameLabelMandatory
 				break loop
 			}
+
+			var ref uint64
+			ref, err = app.Add(lset, t, v)
+			sampleAdded, err = sl.checkAddError(nil, met, tp, err, &sampleLimitErr, appErrs)
+			if err != nil {
+				if err != storage.ErrNotFound {
+					level.Debug(sl.l).Log("msg", "unexpected error", "series", string(met), "err", err)
+				}
+				break loop
+			}
+
 			if tp == nil {
 				// Bypass staleness logic if there is an explicit timestamp.
 				sl.cache.trackStaleness(hash, lset)
 			}
+
 			ce = sl.cache.addRef(mets, ref, lset, hash)
-			seriesAdded++
+			if sampleAdded && sampleLimitErr == nil {
+				seriesAdded++
+			}
+
+			//检测是否是KubePodMetrics的Loop
+			if sl.kubePodLabelsStatus == 0 {
+				if hasKubePodMetrics(lset) {
+					sl.kubePodLabelsStatus = 1
+				} else {
+					sl.kubePodLabelsStatus = -1
+				}
+			}
 		}
-		added++
+
+		// Increment added even if there's a sampleLimitErr so we correctly report the number of samples scraped.
+		if sampleAdded || sampleLimitErr != nil {
+			added++
+		}
 
 		if insight.Manager != nil && insight.Manager.SendRemote() && ce != nil {
-			addFun(ce.key, t, v)
+			//建立pod-app-env索引
+			if insight.IsRelabel && sl.kubePodLabelsStatus == 1 && ce.lset[0].Value == kubePodLabels {
+				podInfo := insight.PodInfo(ce.lset)
+				if podInfo != nil {
+					writeRelabelMap[podInfo.Pod] = podInfo
+				}
+			}
+
+			if len(whiteList) == 0 {
+				addFun(ce, t, v)
+			} else {
+				//应用白名单
+				if _, ok := whiteList[ce.lset[0].Value]; ok {
+					addFun(ce, t, v)
+				}
+			}
 		}
 	}
 	if sampleLimitErr != nil {
@@ -1189,20 +1282,30 @@ loop:
 		// We only want to increment this once per scrape, so this is Inc'd outside the loop.
 		targetScrapeSampleLimit.Inc()
 	}
-	if numOutOfOrder > 0 {
-		level.Warn(sl.l).Log("msg", "Error on ingesting out-of-order samples", "num_dropped", numOutOfOrder)
+	if appErrs.numOutOfOrder > 0 {
+		level.Warn(sl.l).Log("msg", "Error on ingesting out-of-order samples", "num_dropped", appErrs.numOutOfOrder)
 	}
-	if numDuplicates > 0 {
-		level.Warn(sl.l).Log("msg", "Error on ingesting samples with different value but same timestamp", "num_dropped", numDuplicates)
+	if appErrs.numDuplicates > 0 {
+		level.Warn(sl.l).Log("msg", "Error on ingesting samples with different value but same timestamp", "num_dropped", appErrs.numDuplicates)
 	}
-	if numOutOfBounds > 0 {
-		level.Warn(sl.l).Log("msg", "Error on ingesting samples that are too old or are too far into the future", "num_dropped", numOutOfBounds)
+	if appErrs.numOutOfBounds > 0 {
+		level.Warn(sl.l).Log("msg", "Error on ingesting samples that are too old or are too far into the future", "num_dropped", appErrs.numOutOfBounds)
 	}
 	if err == nil {
+		if insight.Manager != nil && insight.Manager.SendRemote() {
+			if sl.kubePodLabelsStatus == 1 && len(writeRelabelMap) > 0 {
+				//是kube-status-metrics才更新索引
+				insight.RelabelMap.SetMap(writeRelabelMap)
+				level.Info(sl.l).Log("msg", "Index on relabels ", "Index Pod Count", len(writeRelabelMap))
+			}
+			insight.Manager.WriteToRemote(&metrics.Metrics{ms})
+			sl.lastScrapeCount = total
+		}
+
 		sl.cache.forEachStale(func(lset labels.Labels) bool {
 			// Series no longer exposed, mark it stale.
 			_, err = app.Add(lset, defTime, math.Float64frombits(value.StaleNaN))
-			switch err {
+			switch errors.Cause(err) {
 			case storage.ErrOutOfOrderSample, storage.ErrDuplicateSampleForTimestamp:
 				// Do not count these in logging, as this is expected if a target
 				// goes away and comes back again with a new scrape loop.
@@ -1211,28 +1314,48 @@ loop:
 			return err == nil
 		})
 	}
-	if err != nil {
-		app.Rollback()
-		return total, added, seriesAdded, err
-	}
-	if err := app.Commit(); err != nil {
-		return total, added, seriesAdded, err
-	}
-
-	if insight.Manager != nil && insight.Manager.SendRemote() {
-		insight.Manager.WriteToRemote(&metrics.Metrics{ms})
-		sl.lastScrapeCount = total
-	}
-
-	// Only perform cache cleaning if the scrape was not empty.
-	// An empty scrape (usually) is used to indicate a failed scrape.
-	sl.cache.iterDone(len(b) > 0)
-
-	return total, added, seriesAdded, nil
+	return
 }
 
 func yoloString(b []byte) string {
 	return *((*string)(unsafe.Pointer(&b)))
+}
+
+// Adds samples to the appender, checking the error, and then returns the # of samples added,
+// whether the caller should continue to process more samples, and any sample limit errors.
+
+func (sl *scrapeLoop) checkAddError(ce *cacheEntry, met []byte, tp *int64, err error, sampleLimitErr *error, appErrs appendErrors) (bool, error) {
+	switch errors.Cause(err) {
+	case nil:
+		if tp == nil && ce != nil {
+			sl.cache.trackStaleness(ce.hash, ce.lset)
+		}
+		return true, nil
+	case storage.ErrNotFound:
+		return false, storage.ErrNotFound
+	case storage.ErrOutOfOrderSample:
+		appErrs.numOutOfOrder++
+		level.Debug(sl.l).Log("msg", "Out of order sample", "series", string(met))
+		targetScrapeSampleOutOfOrder.Inc()
+		return false, nil
+	case storage.ErrDuplicateSampleForTimestamp:
+		appErrs.numDuplicates++
+		level.Debug(sl.l).Log("msg", "Duplicate sample for timestamp", "series", string(met))
+		targetScrapeSampleDuplicate.Inc()
+		return false, nil
+	case storage.ErrOutOfBounds:
+		appErrs.numOutOfBounds++
+		level.Debug(sl.l).Log("msg", "Out of bounds metric", "series", string(met))
+		targetScrapeSampleOutOfBounds.Inc()
+		return false, nil
+	case errSampleLimit:
+		// Keep on parsing output if we hit the limit, so we report the correct
+		// total number of samples scraped.
+		*sampleLimitErr = err
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // The constants are suffixed with the invalid \xff unicode rune to avoid collisions
@@ -1245,86 +1368,78 @@ const (
 	scrapeSeriesAddedMetricName  = "scrape_series_added" + "\xff"
 )
 
-func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scraped, appended, seriesAdded int, err error) error {
-	sl.scraper.report(start, duration, err)
+func (sl *scrapeLoop) report(start time.Time, duration time.Duration, scraped, appended, seriesAdded int, scrapeErr error) (err error) {
+	sl.scraper.Report(start, duration, scrapeErr)
 
 	ts := timestamp.FromTime(start)
 
 	var health float64
-	if err == nil {
+	if scrapeErr == nil {
 		health = 1
 	}
 	app := sl.appender()
+	defer func() {
+		if err != nil {
+			app.Rollback()
+			return
+		}
+		err = app.Commit()
+	}()
 
-	if err := sl.addReportSample(app, scrapeHealthMetricName, ts, health); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeHealthMetricName, ts, health); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeDurationMetricName, ts, duration.Seconds()); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeDurationMetricName, ts, duration.Seconds()); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeSamplesMetricName, ts, float64(scraped)); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeSamplesMetricName, ts, float64(scraped)); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, samplesPostRelabelMetricName, ts, float64(appended)); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, float64(appended)); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, float64(seriesAdded)); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, float64(seriesAdded)); err != nil {
+		return
 	}
-	return app.Commit()
+	return
 }
 
-func (sl *scrapeLoop) reportStale(start time.Time) error {
+func (sl *scrapeLoop) reportStale(start time.Time) (err error) {
 	ts := timestamp.FromTime(start)
 	app := sl.appender()
+	defer func() {
+		if err != nil {
+			app.Rollback()
+			return
+		}
+		err = app.Commit()
+	}()
 
 	stale := math.Float64frombits(value.StaleNaN)
 
-	if err := sl.addReportSample(app, scrapeHealthMetricName, ts, stale); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeHealthMetricName, ts, stale); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeDurationMetricName, ts, stale); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeDurationMetricName, ts, stale); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeSamplesMetricName, ts, stale); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeSamplesMetricName, ts, stale); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, samplesPostRelabelMetricName, ts, stale); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, stale); err != nil {
+		return
 	}
-	if err := sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, stale); err != nil {
-		app.Rollback()
-		return err
+	if err = sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, stale); err != nil {
+		return
 	}
-	return app.Commit()
+	return
 }
 
 func (sl *scrapeLoop) addReportSample(app storage.Appender, s string, t int64, v float64) error {
 	ce, ok := sl.cache.get(s)
 	if ok {
-		err := app.AddFast(ce.lset, ce.ref, t, v)
-
-		ms := make([]*metrics.Metric, 0, 1)
-		m := &metrics.Metric{
-			Time:      t,
-			Value:     v,
-			MetricKey: ce.key,
-		}
-		ms = append(ms, m)
-		if insight.Manager != nil && insight.Manager.SendRemote() {
-			insight.Manager.WriteToRemote(&metrics.Metrics{ms})
-		}
-
-		switch err {
+		err := app.AddFast(ce.ref, t, v)
+		switch errors.Cause(err) {
 		case nil:
 			return nil
 		case storage.ErrNotFound:
@@ -1348,7 +1463,7 @@ func (sl *scrapeLoop) addReportSample(app storage.Appender, s string, t int64, v
 	lset = sl.reportSampleMutator(lset)
 
 	ref, err := app.Add(lset, t, v)
-	switch err {
+	switch errors.Cause(err) {
 	case nil:
 		sl.cache.addRef(s, ref, lset, hash)
 		return nil
@@ -1359,24 +1474,86 @@ func (sl *scrapeLoop) addReportSample(app storage.Appender, s string, t int64, v
 	}
 }
 
-func labelsKey(lset labels.Labels) string {
+// zeroConfig returns a new scrape config that only contains configuration items
+// that alter metrics.
+func zeroConfig(c *config.ScrapeConfig) *config.ScrapeConfig {
+	z := *c
+	// We zero out the fields that for sure don't affect scrape.
+	z.ScrapeInterval = 0
+	z.ScrapeTimeout = 0
+	z.SampleLimit = 0
+	z.HTTPClientConfig = config_util.HTTPClientConfig{}
+	return &z
+}
+
+// reusableCache compares two scrape config and tells whether the cache is still
+// valid.
+func reusableCache(r, l *config.ScrapeConfig) bool {
+	if r == nil || l == nil {
+		return false
+	}
+	return reflect.DeepEqual(zeroConfig(r), zeroConfig(l))
+}
+
+func labelsKey(lset labels.Labels, podMap map[string]*insight.AppEnv) (string, bool) {
 	if len(lset) == 1 {
-		return lset[0].Name + " 0"
+		return lset[0].Value + " 0", false
+	}
+
+	//是否含有pod,pod_name
+	var reDefineLbs []byte
+	var lostIndex bool
+	if insight.IsRelabel {
+		if lset[0].Value != kubePodLabels {
+			reDefineLbs, lostIndex = insight.Relabel(lset, podMap)
+		}
 	}
 
 	var b bytes.Buffer
+	b.Grow(len(lset) * 32)
 	b.WriteString(lset[0].Value)
 	b.WriteByte('{')
-	for i, l := range lset[1:] {
+
+	if len(reDefineLbs) > 0 {
+		b.Write(reDefineLbs)
+		b.WriteByte(',')
+		if insight.WithOldLabels() {
+			oldLables(lset[1:], &b)
+		} else {
+			cname := lset.Get("container_name")
+			if len(cname) > 0 {
+				if cname == "POD" || strings.HasPrefix(cname, "filebeat") {
+					//cname = "app"
+					b.WriteString("container_name")
+					b.WriteByte('=')
+					b.WriteString(strconv.Quote(cname))
+				}
+			}
+		}
+	} else {
+		oldLables(lset[1:], &b)
+	}
+
+	b.WriteString("} 0")
+	return b.String(), lostIndex
+}
+
+func oldLables(lset labels.Labels, b *bytes.Buffer) {
+	for i, l := range lset {
 		if i > 0 {
 			b.WriteByte(',')
-			b.WriteByte(' ')
 		}
 		b.WriteString(l.Name)
 		b.WriteByte('=')
 		b.WriteString(strconv.Quote(l.Value))
 	}
+}
 
-	b.WriteString("} 0")
-	return b.String()
+func hasLabel(lset labels.Labels, k, v string) bool {
+	return lset.Get(k) == v
+}
+
+//含有这两个标签，说明是 kube-state-metrics的 metric所在
+func hasKubePodMetrics(lset labels.Labels) bool {
+	return hasLabel(lset, "job", "kube-state-metrics") && hasLabel(lset, "endpoint", "https-main")
 }

@@ -12,7 +12,7 @@ import (
 )
 
 type Appendable interface {
-	Appender() (storage.Appender, error)
+	Appender() storage.Appender
 }
 
 type Manager struct {
@@ -91,6 +91,10 @@ func (m *Manager) Stop() {
 		if m.rpcSender != nil {
 			m.rpcSender.Stop()
 		}
+
+		if m.metricFilter != nil {
+			m.metricFilter.StopLoop()
+		}
 	}
 
 	log.Info("rpc manager stop!!!")
@@ -104,8 +108,9 @@ func (m *Manager) MetricsFilterConfig(whiteListFile string) *MetricFilter {
 
 func (m *Manager) WriteToRemote(ms *metrics.Metrics) {
 	if m.rpcSender != nil {
-		mList := m.metricFilter.Filter(ms)
-		if err := m.rpcSender.Send(mList); err != nil {
+		//这里注释了， 在抓取端过滤了
+		//mList := m.metricFilter.Filter(ms)
+		if err := m.rpcSender.Send(ms); err != nil {
 			log.Errorf("write to remote error:%s", err.Error())
 		}
 	}
